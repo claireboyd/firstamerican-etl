@@ -50,6 +50,7 @@ def convert_sales(filename, input_dir):
         (pl.scan_csv(Path(unzipped_filepath), separator = '|', low_memory = True, try_parse_dates=True, infer_schema_length=1000, ignore_errors = True, truncate_ragged_lines = True)
             .select(['PropertyID', 'SaleAmt', 'RecordingDate', 'FIPS', 'FATimeStamp', 'FATransactionID', 'TransactionType', 'SaleDate'])
                 .filter(pl.col('PropertyID').is_not_null())
+                .with_columns([(pl.col('SaleAmt').cast(pl.Int64))])
                 .filter((pl.col('SaleAmt') > 0) & (pl.col('SaleAmt').is_not_null()))
                 .with_columns(pl.col('RecordingDate').cast(pl.Utf8).str.slice(offset=0,length = 4).alias("RecordingYearSlice"))
                 .with_columns([
@@ -62,10 +63,10 @@ def convert_sales(filename, input_dir):
                     (pl.when(pl.col('TransactionType').cast(pl.Utf8).is_in(['1', '2', '3', '4', '5', '6'])).then(pl.col('TransactionType').cast(pl.Utf8)).otherwise(None).name.keep()),
                     ])
                 .with_columns([
-                    (pl.col("RecordingDate").dt.year().alias("RecordingYear")),
+                    (pl.col("RecordingDate").dt.year().alias("RecordingYear").cast(pl.Int64)),
                     (pl.col('SaleDate').dt.year().alias("SaleYear")),
                     (pl.col('FATimeStamp').dt.year().alias("FATimeStampYear")),
-                    (pl.when((pl.col("FATransactionID_1").is_in(['1', '6'])) & (pl.col('TransactionType').is_in(['2', '3']))).then(1).otherwise(0).alias("SaleFlag"))
+                    (pl.when((pl.col("FATransactionID_1").is_in(['1', '6'])) & (pl.col('TransactionType').is_in(['2', '3']))).then(1).otherwise(0).alias("SaleFlag")),
                 ])                     
             ).sink_parquet(Path(output_filepath), compression="snappy")
         logging.info(f"{output_filepath} complete.")
@@ -82,6 +83,9 @@ def convert_sales(filename, input_dir):
                 #(pl.coalesce(pl.col(["SaleYear", "RecordingYear"])).cast(pl.Int16).alias("SaleRecordingYear")),
                 (pl.col("RecordingDate").rank(method="random", descending = True, seed = 1).over(['RecordingYear', "PropertyID"]).alias("RecentSaleByYear")),
                 (pl.col("RecordingDate").rank(method="random", descending = True, seed = 1).over(["PropertyID"]).alias("MostRecentSale")),
+                (pl.col('PropertyID').cast(pl.Int64)),
+                (pl.col('RecordingYear').cast(pl.Int64)),
+                (pl.col('SaleAmt').cast(pl.Int64)),
             ])
             .filter(pl.col('RecentSaleByYear') == 1)
             ).select(['PropertyID', 'SaleAmt', 'RecordingYear']
@@ -284,16 +288,50 @@ def join(input_dir, valhist_filename, prop_filename, ranked_deed_filename):
         # first join in the data from the annual file (prop characteristics)
         other= prop,
         how = "left",
-        on= ['PropertyID'],
+        left_on=['PropertyID'], 
+        right_on =['PropertyID'],
         #validate='m:1', #checks if only 1 propertyid in annual file
         force_parallel=True
 
-    # ).join(
-    #     # second join in the data from the most recent sale of each year
-    #     other=ranked_deed,
-    #     left_on=['PropertyID', ''],
-    #     right_on=['PropertyID', ''],
-    #     force_parallel=True
+    # choose year/value (assd, market, then appr if not null)
+    ).with_columns([
+        pl.when(pl.col("AssdYear").is_not_null())
+            .then(pl.col("AssdYear"))
+            .when(pl.col("MarketValueYear").is_not_null())
+            .then(pl.col("MarketValueYear"))
+            .when(pl.col("ApprYear").is_not_null())
+            .then(pl.col("ApprYear"))
+            .otherwise(None)
+            .alias("Year").cast(pl.Int64),
+        pl.when(pl.col("AssdYear").is_not_null())
+            .then(pl.col("AssdTotalValue"))
+            .when(pl.col("MarketValueYear").is_not_null())
+            .then(pl.col("MarketValueYear"))
+            .when(pl.col("ApprYear").is_not_null())
+            .then(pl.col("ApprYear"))
+            .otherwise(None)
+            .alias("Value").cast(pl.Int64),
+        pl.when(pl.col("AssdYear").is_not_null())
+            .then("Assd")
+            .when(pl.col("MarketValueYear").is_not_null())
+            .then("Market")
+            .when(pl.col("ApprYear").is_not_null())
+            .then("Appr")
+            .otherwise(None)
+            .alias("AssessmentUsed")
+    ]    
+    # filter out for only the residential properties
+    ).filter(
+        pl.col("PropertyClassID") == 'R'
+
+    ).join(
+        # second join in the data from the most recent sale of each year
+        other=ranked_deed,
+        how='left',
+        left_on=['PropertyID', 'Year'], 
+        right_on=['PropertyID','RecordingYear']
+        # force_parallel=True
+        # sink to output filepath
 
     ).sink_parquet(output_filepath, compression="snappy")
 
@@ -394,3 +432,5 @@ if __name__ == "__main__":
 
 # sample line of code to run the scipt
 # python fa-etl.py --input_dir dev/48203 --log_file dev/48203/deployments/deployment.log
+# python fa-etl.py --input_dir dev/42101 --log_file dev/42101/deployments/deployment.log
+# python fa-etl.py --input_dir dev/36061 --log_file dev/36061/deployments/deployment.log

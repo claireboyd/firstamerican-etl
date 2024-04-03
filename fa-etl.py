@@ -221,6 +221,7 @@ def convert_valhist(filename, input_dir):
     input_filepath = input_dir + "/raw/" + filename
     output_dir = input_dir + "/" + "staging"
     output_filepath = output_dir + "/" + filename.replace(".txt.zip", ".parquet")
+    output_filepath_ranked = output_dir + "/ranked_" + filename.replace(".txt.zip", ".parquet")
 
     # check if parquet already exists, if it does, skip
     if os.path.exists(output_filepath):
@@ -248,8 +249,59 @@ def convert_valhist(filename, input_dir):
             (pl.col('ApprYear').cast(pl.Int64)),
             (pl.col('TaxableYear').cast(pl.Int64)),
         ])
+        # choose year/value (assd, market, then appr if not null)
+        .with_columns([
+            pl.when(((pl.col("AssdYear").is_not_null()) | (pl.col("AssdYear") == 0))
+                    & (pl.col("AssdYear") > pl.col("MarketValueYear")))
+                .then(pl.col("AssdYear"))
+                .when((pl.col("MarketValueYear").is_not_null()) | (pl.col("MarketValueYear") == 0))
+                .then(pl.col("MarketValueYear"))
+                .when((pl.col("ApprYear").is_not_null()) | (pl.col("ApprYear") == 0))
+                .then(pl.col("ApprYear"))
+                .otherwise(None)
+                .alias("Year").cast(pl.Int64),
+            pl.when(((pl.col("AssdYear").is_not_null()) | (pl.col("AssdYear") == 0))
+                    & (pl.col("AssdYear") > pl.col("MarketValueYear")))
+                .then(pl.col("AssdTotalValue"))
+                .when((pl.col("MarketValueYear").is_not_null()) | (pl.col("MarketValueYear") == 0))
+                .then(pl.col("MarketTotalValue"))
+                .when((pl.col("ApprYear").is_not_null()) | (pl.col("ApprYear") == 0))
+                .then(pl.col("ApprTotalValue"))
+                .otherwise(None)
+                .alias("Value").cast(pl.Int64),
+            pl.when(((pl.col("AssdYear").is_not_null()) | (pl.col("AssdYear") == 0))
+                    & (pl.col("AssdYear") > pl.col("MarketValueYear")))
+                .then(pl.lit('Assd'))
+                .when((pl.col("MarketValueYear").is_not_null()) | (pl.col("MarketValueYear") == 0))
+                .then(pl.lit('Market'))
+                .when((pl.col("ApprYear").is_not_null()) | (pl.col("ApprYear") == 0))
+                .then(pl.lit('Appr'))
+                .otherwise(None)
+                .alias("AssessmentUsed")
+        ])
         ).sink_parquet(Path(output_filepath), compression="snappy")
     logging.info(f"{output_filepath} complete.")
+
+    # ranked valhist file
+    try:
+        logging.info(f"Creating {output_filepath_ranked}...")
+        valhist_ranked = (pl.scan_parquet(Path(output_filepath), low_memory = True, parallel='row_groups', use_statistics=False, hive_partitioning=False)
+            # rank to the most recent valuation history by propertyid
+            .with_columns([
+                (pl.col("Year").rank(method="random", descending = True, seed = 1)
+                    .over(['Year', "PropertyID"])
+                    .alias("RecentValueByYear")),
+            # limit to only the most recent value of each property
+            ]).filter(
+                pl.col("RecentValueByYear") == 1
+            )
+            ).collect(streaming=True)
+        valhist_ranked.write_parquet(Path(output_filepath_ranked), use_pyarrow=True, compression="snappy")
+        valhist_ranked.clear()
+        logging.info(f"{output_filepath_ranked} complete.")
+    except Exception as e:
+        os.remove(output_filepath_ranked)
+        logging.info(f"Error: {str(e)}")
 
     #delete unzipped file for memory conservation
     logging.info("Deleting unzipped txt file...")
@@ -293,37 +345,36 @@ def join(input_dir, valhist_filename, prop_filename, ranked_deed_filename):
         #validate='m:1', #checks if only 1 propertyid in annual file
         force_parallel=True
 
-    # choose year/value (assd, market, then appr if not null)
-    ).with_columns([
-        pl.when(pl.col("AssdYear").is_not_null())
-            .then(pl.col("AssdYear"))
-            .when(pl.col("MarketValueYear").is_not_null())
-            .then(pl.col("MarketValueYear"))
-            .when(pl.col("ApprYear").is_not_null())
-            .then(pl.col("ApprYear"))
-            .otherwise(None)
-            .alias("Year").cast(pl.Int64),
-        pl.when(pl.col("AssdYear").is_not_null())
-            .then(pl.col("AssdTotalValue"))
-            .when(pl.col("MarketValueYear").is_not_null())
-            .then(pl.col("MarketValueYear"))
-            .when(pl.col("ApprYear").is_not_null())
-            .then(pl.col("ApprYear"))
-            .otherwise(None)
-            .alias("Value").cast(pl.Int64),
-        pl.when(pl.col("AssdYear").is_not_null())
-            .then("Assd")
-            .when(pl.col("MarketValueYear").is_not_null())
-            .then("Market")
-            .when(pl.col("ApprYear").is_not_null())
-            .then("Appr")
-            .otherwise(None)
-            .alias("AssessmentUsed")
-    ]    
+    # # choose year/value (assd, market, then appr if not null)
+    # ).with_columns([
+    #     pl.when(pl.col("AssdYear").is_not_null())
+    #         .then(pl.col("AssdYear"))
+    #         .when(pl.col("MarketValueYear").is_not_null())
+    #         .then(pl.col("MarketValueYear"))
+    #         .when(pl.col("ApprYear").is_not_null())
+    #         .then(pl.col("ApprYear"))
+    #         .otherwise(None)
+    #         .alias("Year").cast(pl.Int64),
+    #     pl.when(pl.col("AssdYear").is_not_null())
+    #         .then(pl.col("AssdTotalValue"))
+    #         .when(pl.col("MarketValueYear").is_not_null())
+    #         .then(pl.col("MarketValueYear"))
+    #         .when(pl.col("ApprYear").is_not_null())
+    #         .then(pl.col("ApprYear"))
+    #         .otherwise(None)
+    #         .alias("Value").cast(pl.Int64),
+    #     pl.when(pl.col("AssdYear").is_not_null())
+    #         .then("Assd")
+    #         .when(pl.col("MarketValueYear").is_not_null())
+    #         .then("Market")
+    #         .when(pl.col("ApprYear").is_not_null())
+    #         .then("Appr")
+    #         .otherwise(None)
+    #         .alias("AssessmentUsed")
+    # ]    
     # filter out for only the residential properties
     ).filter(
         pl.col("PropertyClassID") == 'R'
-
     ).join(
         # second join in the data from the most recent sale of each year
         other=ranked_deed,
@@ -332,6 +383,9 @@ def join(input_dir, valhist_filename, prop_filename, ranked_deed_filename):
         right_on=['PropertyID','RecordingYear']
         # force_parallel=True
         # sink to output filepath
+
+    #assumption that sale amount is off by 10x
+    
 
     ).sink_parquet(output_filepath, compression="snappy")
 
